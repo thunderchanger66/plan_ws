@@ -89,6 +89,8 @@ public:
     declare_parameter("startup_takeoff_duration_sec", 2.5);
     declare_parameter("startup_takeoff_velocity_tolerance_mps", 0.12);
     declare_parameter("startup_takeoff_stable_samples", 10);
+    declare_parameter("trajectory_handoff_duration_sec", 1.0);
+    declare_parameter("initial_vertical_drop_tolerance_m", 0.05);
     declare_parameter("transform_translation", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("transform_rotation_row_major", std::vector<double>{
       1.0, 0.0, 0.0,
@@ -137,6 +139,10 @@ public:
       get_parameter("startup_takeoff_velocity_tolerance_mps").as_double();
     startup_takeoff_required_samples_ =
       get_parameter("startup_takeoff_stable_samples").as_int();
+    trajectory_handoff_duration_sec_ =
+      get_parameter("trajectory_handoff_duration_sec").as_double();
+    initial_vertical_drop_tolerance_m_ =
+      get_parameter("initial_vertical_drop_tolerance_m").as_double();
     if (!std::isfinite(max_command_age_sec_) || max_command_age_sec_ <= 0.0 ||
       !std::isfinite(prestream_seconds_) || prestream_seconds_ < 0.0 ||
       !std::isfinite(max_velocity_mps_) || max_velocity_mps_ <= 0.0 ||
@@ -150,7 +156,9 @@ public:
       !std::isfinite(startup_takeoff_velocity_tolerance_mps_) ||
       startup_takeoff_velocity_tolerance_mps_ <= 0.0 ||
       !std::isfinite(startup_takeoff_duration_sec_) || startup_takeoff_duration_sec_ <= 0.0 ||
-      startup_takeoff_required_samples_ < 1)
+      startup_takeoff_required_samples_ < 1 ||
+      !std::isfinite(trajectory_handoff_duration_sec_) || trajectory_handoff_duration_sec_ <= 0.0 ||
+      !std::isfinite(initial_vertical_drop_tolerance_m_) || initial_vertical_drop_tolerance_m_ < 0.0)
     {
       throw std::runtime_error("startup takeoff altitude and tolerance must be valid");
     }
@@ -439,11 +447,45 @@ private:
       return;
     }
 
+    // The first planner sample is handed over from the measured PX4 position.
+    // A delayed B-spline sample must not create a vertical step when the
+    // vehicle leaves its startup hover.
+    const bool handoff_required = (!planner_command_seen_ || bridge_emergency_hold_);
+    if (handoff_required && local_position_) {
+      const double current_z = (*local_position_)[2];
+      if (output.position[2] > current_z) {
+        const bool material_drop = output.position[2] >
+          current_z + initial_vertical_drop_tolerance_m_;
+        output.position[2] = current_z;
+        output.velocity[2] = 0.0;
+        output.acceleration[2] = 0.0;
+        publish_status(material_drop ?
+          "initial_trajectory_downward_height_clamped_to_current_px4_position" :
+          "initial_trajectory_height_aligned_to_current_px4_position");
+      }
+      handoff_start_setpoint_.position = *local_position_;
+      handoff_start_setpoint_.velocity = {0.0, 0.0, 0.0};
+      handoff_start_setpoint_.acceleration = {0.0, 0.0, 0.0};
+      handoff_start_setpoint_.yaw = px4_heading_;
+      handoff_start_setpoint_.yaw_rate = 0.0;
+      handoff_target_setpoint_ = output;
+      trajectory_handoff_active_ = true;
+      handoff_start_time_ = std::chrono::steady_clock::now();
+      latest_setpoint_ = handoff_start_setpoint_;
+      publish_status(bridge_emergency_hold_ ?
+        "trajectory_recovery_handoff_started_from_current_px4_position" :
+        "initial_trajectory_handoff_started_from_current_px4_position");
+    }
+
     last_trajectory_id_ = msg->trajectory_id;
     latest_command_time_ = std::chrono::steady_clock::now();
     bridge_emergency_hold_ = false;
     held_trajectory_id_.reset();
-    latest_setpoint_ = output;
+    handoff_pending_setpoint_ = output;
+    if (!trajectory_handoff_active_) {
+      latest_setpoint_ = output;
+    }
+    planner_command_seen_ = true;
     if (!first_command_time_) {
       first_command_time_ = std::chrono::steady_clock::now();
       offboard_requested_ = false;
@@ -478,6 +520,7 @@ private:
       return;
     }
     update_startup_takeoff_setpoint();
+    update_trajectory_handoff();
     if (!latest_setpoint_ || observe_only_) {
       return;
     }
@@ -608,6 +651,46 @@ private:
     latest_setpoint_->acceleration = {0.0, 0.0, delta_z * blend_accel};
   }
 
+  void update_trajectory_handoff()
+  {
+    if (!trajectory_handoff_active_ || !handoff_start_time_) {
+      return;
+    }
+    const double elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - *handoff_start_time_).count();
+    const double u = std::clamp(elapsed / trajectory_handoff_duration_sec_, 0.0, 1.0);
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double u4 = u3 * u;
+    const double u5 = u4 * u;
+    const double blend = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+    const double blend_rate = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) /
+      trajectory_handoff_duration_sec_;
+    const double blend_accel = (60.0 * u - 180.0 * u2 + 120.0 * u3) /
+      (trajectory_handoff_duration_sec_ * trajectory_handoff_duration_sec_);
+
+    Setpoint handoff = handoff_start_setpoint_;
+    for (size_t axis = 0; axis < 3; ++axis) {
+      const double delta = handoff_target_setpoint_.position[axis] -
+        handoff_start_setpoint_.position[axis];
+      handoff.position[axis] = handoff_start_setpoint_.position[axis] + delta * blend;
+      handoff.velocity[axis] = delta * blend_rate;
+      handoff.acceleration[axis] = delta * blend_accel;
+    }
+    const double yaw_delta = std::atan2(
+      std::sin(handoff_target_setpoint_.yaw - handoff_start_setpoint_.yaw),
+      std::cos(handoff_target_setpoint_.yaw - handoff_start_setpoint_.yaw));
+    handoff.yaw = handoff_start_setpoint_.yaw + yaw_delta * blend;
+    handoff.yaw_rate = yaw_delta * blend_rate;
+    latest_setpoint_ = handoff;
+    if (u >= 1.0) {
+      trajectory_handoff_active_ = false;
+      latest_setpoint_ = handoff_pending_setpoint_.value_or(handoff_target_setpoint_);
+      handoff_pending_setpoint_.reset();
+      publish_status("initial_trajectory_handoff_complete");
+    }
+  }
+
   bool command_retry_due(const std::chrono::steady_clock::time_point now) const
   {
     return !last_vehicle_command_time_ ||
@@ -666,16 +749,23 @@ private:
   double startup_takeoff_tolerance_m_{0.08};
   double startup_takeoff_duration_sec_{2.5};
   double startup_takeoff_velocity_tolerance_mps_{0.12};
+  double trajectory_handoff_duration_sec_{1.0};
+  double initial_vertical_drop_tolerance_m_{0.05};
   int startup_takeoff_required_samples_{10};
   int startup_takeoff_stable_samples_{0};
   double px4_heading_{0.0};
   bool startup_takeoff_initialized_{false};
   bool startup_takeoff_complete_{false};
   bool takeoff_rejection_reported_{false};
+  bool planner_command_seen_{false};
+  bool trajectory_handoff_active_{false};
   Vector3 translation_{};
   Matrix3 rotation_{};
   Vector3 takeoff_origin_{};
   Vector3 takeoff_target_{};
+  Setpoint handoff_start_setpoint_{};
+  Setpoint handoff_target_setpoint_{};
+  std::optional<Setpoint> handoff_pending_setpoint_;
   std::optional<Vector3> local_position_;
   std::optional<Setpoint> latest_setpoint_;
   std::optional<double> manual_yaw_;
@@ -684,6 +774,7 @@ private:
   std::optional<std::chrono::steady_clock::time_point> last_vehicle_command_time_;
   std::optional<std::chrono::steady_clock::time_point> last_planner_status_time_;
   std::optional<rclcpp::Time> startup_takeoff_start_time_;
+  std::optional<std::chrono::steady_clock::time_point> handoff_start_time_;
   std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
   uint64_t px4_timestamp_{0};
   rclcpp::Subscription<PositionCommand>::SharedPtr command_sub_;

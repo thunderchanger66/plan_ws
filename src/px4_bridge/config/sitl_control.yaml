@@ -30,6 +30,8 @@ px4_bridge:
     startup_takeoff_velocity_tolerance_mps: 0.12
     startup_takeoff_stable_samples: 10
     startup_takeoff_duration_sec: 2.5
+    trajectory_handoff_duration_sec: 1.0
+    initial_vertical_drop_tolerance_m: 0.05
     # FAST-LIO and PX4 local position are both relative to their EKF startup
     # positions, so the MID-360 mounting offset is not a local-frame offset.
     # The MID-360 model has a pi mount yaw and the plugin applies another
